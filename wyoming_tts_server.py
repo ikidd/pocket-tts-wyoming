@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Wyoming Protocol TTS Server for Pocket-TTS (Official Repo Version)
-Optimized for Streaming, Debug Timings and Multi-Version Compatibility.
+Optimized for Streaming and Home Assistant Debug Timings.
 """
 
 import argparse
@@ -36,7 +36,6 @@ DEFAULT_PORT = int(os.environ.get("WYOMING_PORT", "10201"))
 DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "alba")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", DEFAULT_VARIANT)
 
-# Tuning für das Prefix-Trimming
 PREFIX_MIN_DURATION = float(os.environ.get("PREFIX_MIN_DURATION", "0.1"))
 PREFIX_MAX_DURATION = float(os.environ.get("PREFIX_MAX_DURATION", "1.0"))
 PREFIX_SILENCE_GAP = float(os.environ.get("PREFIX_SILENCE_GAP", "0.08"))
@@ -61,14 +60,21 @@ class PocketTTSEventHandler(AsyncEventHandler):
             return True
 
         try:
+            # Normales TTS (z.B. über das Medien-Tab)
             if Synthesize.is_type(event.type):
-                if self.is_streaming: return True
                 synthesize = Synthesize.from_event(event)
-                await self._handle_synthesize(synthesize, send_start=True, send_stop=True)
+                # Bestätige den Start, damit HA die Zeitmessung beginnt
+                await self.write_event(SynthesizeStart(text=synthesize.text).event())
+                await self._handle_synthesize(synthesize)
+                # Sende das Ende erst ganz zum Schluss
+                await self.write_event(SynthesizeStopped().event())
                 return True
 
+            # Streaming TTS (z.B. über Voice Assistant / LLM)
             if SynthesizeStart.is_type(event.type):
                 stream_start = SynthesizeStart.from_event(event)
+                # Wir schicken das Event zurück als Acknowledge
+                await self.write_event(stream_start.event())
                 self.is_streaming = True
                 self._stream_text = ""
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
@@ -84,8 +90,8 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 assert self._synthesize is not None
                 if self._stream_text.strip():
                     self._synthesize.text = self._stream_text.strip()
-                    await self._handle_synthesize(self._synthesize, send_start=True, send_stop=True)
-
+                    await self._handle_synthesize(self._synthesize)
+                
                 await self.write_event(SynthesizeStopped().event())
                 self.is_streaming = False
                 self._stream_text = ""
@@ -96,15 +102,15 @@ class PocketTTSEventHandler(AsyncEventHandler):
             await self.write_event(Error(text=str(err), code=err.__class__.__name__).event())
             raise err
 
-    async def _handle_synthesize(self, synthesize: Synthesize, send_start: bool = True, send_stop: bool = True) -> bool:
+    async def _handle_synthesize(self, synthesize: Synthesize) -> bool:
+        """Kern-Logik für die Generierung (ohne eigene Stop-Events)"""
         raw_text = synthesize.text
         text = " ".join(raw_text.strip().splitlines())
         if not text:
-            if send_stop: await self.write_event(AudioStop().event())
             return True
 
         _LOGGER.info("Synthesizing: '%s'", text)
-        text = "... " + text # Sacrificial Prefix
+        text = "... " + text 
         
         voice_name = synthesize.voice.name if synthesize.voice else self.cli_args.voice
         if voice_name and voice_name.startswith("pocket-tts-"):
@@ -115,20 +121,17 @@ class PocketTTSEventHandler(AsyncEventHandler):
         async with _VOICE_LOCK:
             global _VOICE_STATES
             if voice_name not in _VOICE_STATES:
-                _LOGGER.info("Loading voice state: %s", voice_name)
-                # KOMPATIBILITÄTS-CHECK für get_state_for_audio_prompt
                 if hasattr(self.tts_model, 'get_state_for_audio_prompt'):
                     _VOICE_STATES[voice_name] = self.tts_model.get_state_for_audio_prompt(voice_name)
                 else:
-                    # Fallback auf den anderen Namen
                     _VOICE_STATES[voice_name] = self.tts_model.get_state_for_voice(voice_name)
             
             voice_state = _VOICE_STATES[voice_name]
 
             try:
                 sample_rate = self.tts_model.sample_rate
-                if send_start:
-                    await self.write_event(AudioStart(rate=sample_rate, width=2, channels=1).event())
+                # Starte den Audiostrom
+                await self.write_event(AudioStart(rate=sample_rate, width=2, channels=1).event())
 
                 audio_stream = self.tts_model.generate_audio_stream(
                     model_state=voice_state, text_to_generate=text, copy_state=True
@@ -156,11 +159,9 @@ class PocketTTSEventHandler(AsyncEventHandler):
                      valid_audio = self._trim_prefix(prefix_buffer, sample_rate)
                      await self._send_audio_data(valid_audio)
 
-                if send_stop:
-                    await self.write_event(AudioStop().event())
-                    await self.write_event(SynthesizeStopped().event())
-
-                _LOGGER.info("Synthesis complete")
+                # Beende den Audiostrom (aber NICHT den gesamten Synthesize-Task)
+                await self.write_event(AudioStop().event())
+                _LOGGER.info("Audio transmission complete")
             except Exception as e:
                 _LOGGER.error("Error synthesis: %s", e, exc_info=True)
                 await self.write_event(Error(text=str(e), code="SynthesisError").event())
@@ -209,16 +210,13 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     
     _LOGGER.info("Loading Pocket-TTS model (%s)...", args.variant)
-    
-    # --- ROBUSTER LADE-FIX ---
-    # Wir übergeben das Argument einfach POSITIONELL (ohne Namen),
-    # das akzeptiert Python immer für das erste Argument.
     try:
         tts_model = TTSModel.load_model(args.variant)
     except TypeError:
-        # Falls das positional auch fehlschlägt, probieren wir 'variant_id'
-        _LOGGER.info("Positional load failed, trying variant_id...")
-        tts_model = TTSModel.load_model(variant_id=args.variant)
+        try:
+            tts_model = TTSModel.load_model(model_variant_id=args.variant)
+        except TypeError:
+            tts_model = TTSModel.load_model(variant_id=args.variant)
     
     _LOGGER.info("Pre-loading voice states...")
     for v in PREDEFINED_VOICES:
