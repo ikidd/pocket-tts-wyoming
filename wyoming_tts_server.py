@@ -63,17 +63,17 @@ class PocketTTSEventHandler(AsyncEventHandler):
             # Normales TTS (z.B. über das Medien-Tab)
             if Synthesize.is_type(event.type):
                 synthesize = Synthesize.from_event(event)
-                # Bestätige den Start, damit HA die Zeitmessung beginnt
-                await self.write_event(SynthesizeStart(text=synthesize.text).event())
+                # FIX: SynthesizeStart nimmt kein 'text' Argument
+                await self.write_event(SynthesizeStart(voice=synthesize.voice).event())
                 await self._handle_synthesize(synthesize)
-                # Sende das Ende erst ganz zum Schluss
+                # Signal für HA: Task abgeschlossen (stoppt den Timer)
                 await self.write_event(SynthesizeStopped().event())
                 return True
 
             # Streaming TTS (z.B. über Voice Assistant / LLM)
             if SynthesizeStart.is_type(event.type):
                 stream_start = SynthesizeStart.from_event(event)
-                # Wir schicken das Event zurück als Acknowledge
+                # Wir bestätigen den Start (spiegelt das Event zurück)
                 await self.write_event(stream_start.event())
                 self.is_streaming = True
                 self._stream_text = ""
@@ -92,6 +92,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
                     self._synthesize.text = self._stream_text.strip()
                     await self._handle_synthesize(self._synthesize)
                 
+                # Signal für HA: Task abgeschlossen
                 await self.write_event(SynthesizeStopped().event())
                 self.is_streaming = False
                 self._stream_text = ""
@@ -99,11 +100,12 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
             return True
         except Exception as err:
+            _LOGGER.error("Error handling event: %s", err)
             await self.write_event(Error(text=str(err), code=err.__class__.__name__).event())
             raise err
 
     async def _handle_synthesize(self, synthesize: Synthesize) -> bool:
-        """Kern-Logik für die Generierung (ohne eigene Stop-Events)"""
+        """Kern-Logik für die Generierung"""
         raw_text = synthesize.text
         text = " ".join(raw_text.strip().splitlines())
         if not text:
@@ -159,7 +161,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
                      valid_audio = self._trim_prefix(prefix_buffer, sample_rate)
                      await self._send_audio_data(valid_audio)
 
-                # Beende den Audiostrom (aber NICHT den gesamten Synthesize-Task)
+                # Beende den Audiostrom
                 await self.write_event(AudioStop().event())
                 _LOGGER.info("Audio transmission complete")
             except Exception as e:
