@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
 Wyoming Protocol TTS Server for Pocket-TTS (Official Repo Version)
-Optimized for Streaming and Home Assistant Debug Timings.
+Optimized for:
+- Sentence-based Text-to-Audio Streaming (LLM Support)
+- Correct Home Assistant Debug Timings (0s Fix)
+- Real-time Audio Streaming
 """
 
 import argparse
 import asyncio
 import logging
 import os
+import re
 from functools import partial
 from typing import Optional
 
@@ -36,6 +40,7 @@ DEFAULT_PORT = int(os.environ.get("WYOMING_PORT", "10201"))
 DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "alba")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", DEFAULT_VARIANT)
 
+# Tuning für das Prefix-Trimming
 PREFIX_MIN_DURATION = float(os.environ.get("PREFIX_MIN_DURATION", "0.1"))
 PREFIX_MAX_DURATION = float(os.environ.get("PREFIX_MAX_DURATION", "1.0"))
 PREFIX_SILENCE_GAP = float(os.environ.get("PREFIX_SILENCE_GAP", "0.08"))
@@ -43,16 +48,17 @@ PREFIX_SILENCE_GAP = float(os.environ.get("PREFIX_SILENCE_GAP", "0.08"))
 _VOICE_STATES: dict[str, dict] = {}
 _VOICE_LOCK = asyncio.Lock()
 
-
 class PocketTTSEventHandler(AsyncEventHandler):
     def __init__(self, wyoming_info: Info, cli_args: argparse.Namespace, tts_model: TTSModel, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.cli_args = cli_args
         self.wyoming_info_event = wyoming_info.event()
         self.tts_model = tts_model
-        self.is_streaming: Optional[bool] = None
-        self._synthesize: Optional[Synthesize] = None
-        self._stream_text: str = ""
+        
+        # Streaming State
+        self.is_streaming: bool = False
+        self._text_buffer: str = ""
+        self._voice_info: Optional[str] = None
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -60,68 +66,91 @@ class PocketTTSEventHandler(AsyncEventHandler):
             return True
 
         try:
-            # Normales TTS (z.B. über das Medien-Tab)
+            # 1. KLASSISCHES TTS (Ein ganzer Textblock auf einmal)
             if Synthesize.is_type(event.type):
                 synthesize = Synthesize.from_event(event)
-                # FIX: SynthesizeStart nimmt kein 'text' Argument
-                await self.write_event(SynthesizeStart(voice=synthesize.voice).event())
-                await self._handle_synthesize(synthesize)
-                # Signal für HA: Task abgeschlossen (stoppt den Timer)
-                await self.write_event(SynthesizeStopped().event())
-                return True
-
-            # Streaming TTS (z.B. über Voice Assistant / LLM)
-            if SynthesizeStart.is_type(event.type):
-                stream_start = SynthesizeStart.from_event(event)
-                # Wir bestätigen den Start (spiegelt das Event zurück)
-                await self.write_event(stream_start.event())
-                self.is_streaming = True
-                self._stream_text = ""
-                self._synthesize = Synthesize(text="", voice=stream_start.voice)
-                return True
-
-            if SynthesizeChunk.is_type(event.type):
-                assert self._synthesize is not None
-                stream_chunk = SynthesizeChunk.from_event(event)
-                self._stream_text += stream_chunk.text
-                return True
-
-            if SynthesizeStop.is_type(event.type):
-                assert self._synthesize is not None
-                if self._stream_text.strip():
-                    self._synthesize.text = self._stream_text.strip()
-                    await self._handle_synthesize(self._synthesize)
+                _LOGGER.info("Klassische Anfrage: '%s'", synthesize.text)
                 
-                # Signal für HA: Task abgeschlossen
+                # Startsignal an HA (Timer startet)
+                await self.write_event(SynthesizeStart(voice=synthesize.voice).event())
+                
+                await self._handle_synthesize(synthesize.text, synthesize.voice)
+                
+                # Stoppsignal an HA (Timer stoppt)
                 await self.write_event(SynthesizeStopped().event())
+                return True
+
+            # 2. START TEXT-STREAMING (LLM schickt Text stückweise)
+            if SynthesizeStart.is_type(event.type):
+                start_event = SynthesizeStart.from_event(event)
+                _LOGGER.info("LLM Text-Stream gestartet")
+                
+                # Bestätige HA den Start (Timer startet)
+                await self.write_event(start_event.event())
+                
+                self.is_streaming = True
+                self._text_buffer = ""
+                self._voice_info = start_event.voice
+                return True
+
+            # 3. TEXT-CHUNK EMPFANGEN (Ein Wort oder Zeichen vom LLM)
+            if SynthesizeChunk.is_type(event.type):
+                chunk = SynthesizeChunk.from_event(event)
+                self._text_buffer += chunk.text
+                
+                # Wir suchen nach Satzzeichen (., !, ?, \n)
+                # Wir splitten den Text, um ganze Sätze zu sprechen (bessere Betonung)
+                if any(c in self._text_buffer for c in ".!?\n"):
+                    # Regex split bei Satzzeichen, behält das Zeichen aber bei
+                    parts = re.split(r'([.!?\n]+)', self._text_buffer)
+                    if len(parts) > 2:
+                        # Alles außer dem letzten Teil (der evtl. unvollständig ist)
+                        to_speak = "".join(parts[:-1]).strip()
+                        self._text_buffer = parts[-1]
+                        
+                        if to_speak:
+                            _LOGGER.info("Satz erkannt: '%s'", to_speak)
+                            await self._handle_synthesize(to_speak, self._voice_info)
+                return True
+
+            # 4. ENDE TEXT-STREAMING (LLM ist fertig)
+            if SynthesizeStop.is_type(event.type):
+                # Rest im Puffer sprechen
+                if self._text_buffer.strip():
+                    _LOGGER.info("Letzter Rest im Stream: '%s'", self._text_buffer.strip())
+                    await self._handle_synthesize(self._text_buffer.strip(), self._voice_info)
+                
+                # Signal an HA: Alles erledigt (Timer stoppt)
+                await self.write_event(SynthesizeStopped().event())
+                _LOGGER.info("LLM Text-Stream beendet.")
                 self.is_streaming = False
-                self._stream_text = ""
+                self._text_buffer = ""
                 return True
 
             return True
         except Exception as err:
-            _LOGGER.error("Error handling event: %s", err)
-            await self.write_event(Error(text=str(err), code=err.__class__.__name__).event())
-            raise err
+            _LOGGER.error("Fehler im Handler: %s", err, exc_info=True)
+            await self.write_event(Error(text=str(err), code="HandlerError").event())
+            return False
 
-    async def _handle_synthesize(self, synthesize: Synthesize) -> bool:
-        """Kern-Logik für die Generierung"""
-        raw_text = synthesize.text
-        text = " ".join(raw_text.strip().splitlines())
-        if not text:
+    async def _handle_synthesize(self, text: str, voice_obj: Optional[any]) -> bool:
+        """Kern-Logik zur Generierung und zum Audio-Streaming"""
+        text_to_speak = text.strip()
+        if not text_to_speak:
             return True
 
-        _LOGGER.info("Synthesizing: '%s'", text)
-        text = "... " + text 
+        # Sacrificial Prefix gegen Wortverschlucken
+        processed_text = "... " + text_to_speak
         
-        voice_name = synthesize.voice.name if synthesize.voice else self.cli_args.voice
+        # Stimme ermitteln
+        voice_name = voice_obj.name if voice_obj else self.cli_args.voice
         if voice_name and voice_name.startswith("pocket-tts-"):
             voice_name = voice_name.replace("pocket-tts-", "", 1)
         if voice_name not in PREDEFINED_VOICES:
             voice_name = self.cli_args.voice
 
         async with _VOICE_LOCK:
-            global _VOICE_STATES
+            # Voice State laden / cachen
             if voice_name not in _VOICE_STATES:
                 if hasattr(self.tts_model, 'get_state_for_audio_prompt'):
                     _VOICE_STATES[voice_name] = self.tts_model.get_state_for_audio_prompt(voice_name)
@@ -132,11 +161,13 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
             try:
                 sample_rate = self.tts_model.sample_rate
-                # Starte den Audiostrom
+                
+                # Audio-Startsignal (Wichtig für das HA Medien-Player Modul)
                 await self.write_event(AudioStart(rate=sample_rate, width=2, channels=1).event())
 
+                # Pocket-TTS Stream Generator
                 audio_stream = self.tts_model.generate_audio_stream(
-                    model_state=voice_state, text_to_generate=text, copy_state=True
+                    model_state=voice_state, text_to_generate=processed_text, copy_state=True
                 )
 
                 prefix_buffer = numpy.array([], dtype=numpy.float32)
@@ -150,105 +181,106 @@ class PocketTTSEventHandler(AsyncEventHandler):
                         prefix_buffer = numpy.concatenate([prefix_buffer, chunk_data])
                         if len(prefix_buffer) >= max_prefix_samples:
                             valid_audio = self._trim_prefix(prefix_buffer, sample_rate)
-                            await self._send_audio_data(valid_audio)
+                            await self._send_audio_chunks(valid_audio, sample_rate)
                             prefix_processed = True
                             prefix_buffer = None
                     else:
-                        await self._send_audio_data(chunk_data)
-                        await asyncio.sleep(0)
+                        # ECHTES STREAMING: Sofort senden
+                        await self._send_audio_chunks(chunk_data, sample_rate)
+                        await asyncio.sleep(0) # Event Loop freigeben
 
+                # Falls der Stream endet bevor der Buffer voll war
                 if not prefix_processed and len(prefix_buffer) > 0:
                      valid_audio = self._trim_prefix(prefix_buffer, sample_rate)
-                     await self._send_audio_data(valid_audio)
+                     await self._send_audio_chunks(valid_audio, sample_rate)
 
-                # Beende den Audiostrom
+                # Audio-Stop (Ende dieses Satzes/Segments)
                 await self.write_event(AudioStop().event())
-                _LOGGER.info("Audio transmission complete")
+                
             except Exception as e:
-                _LOGGER.error("Error synthesis: %s", e, exc_info=True)
-                await self.write_event(Error(text=str(e), code="SynthesisError").event())
+                _LOGGER.error("Fehler bei Generierung: %s", e)
+                return False
         return True
 
     def _trim_prefix(self, audio_data, sample_rate):
-        threshold = (numpy.abs(audio_data).max() if len(audio_data) > 0 else 0) * 0.01
-        min_prefix_samples = int(sample_rate * PREFIX_MIN_DURATION)
-        max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
+        """Findet die Stille nach '...' und schneidet davor ab"""
+        if len(audio_data) == 0: return audio_data
+        threshold = numpy.abs(audio_data).max() * 0.01
+        min_prefix = int(sample_rate * PREFIX_MIN_DURATION)
+        max_prefix = int(sample_rate * PREFIX_MAX_DURATION)
+        silence_gap = int(sample_rate * PREFIX_SILENCE_GAP)
+        
         prefix_end = 0
-        if len(audio_data) > min_prefix_samples:
-            search_end = min(len(audio_data), max_prefix_samples)
+        search_end = min(len(audio_data), max_prefix)
+        if len(audio_data) > min_prefix:
             is_silent = numpy.abs(audio_data[:search_end]) < threshold
-            i = min_prefix_samples
+            i = min_prefix
             while i < search_end:
                 if is_silent[i]:
-                    silence_start = i
+                    start = i
                     while i < search_end and is_silent[i]: i += 1
-                    if (i - silence_start) >= int(sample_rate * PREFIX_SILENCE_GAP):
+                    if (i - start) >= silence_gap:
                         prefix_end = i
                         break
                 else: i += 1
-        return audio_data[prefix_end:] if prefix_end > 0 else audio_data[min_prefix_samples:]
+        return audio_data[prefix_end:] if prefix_end > 0 else audio_data[min_prefix:]
 
-    async def _send_audio_data(self, float_audio):
+    async def _send_audio_chunks(self, float_audio, rate):
+        """Wandelt Float in Int16 und sendet kleine Chunks"""
         if len(float_audio) == 0: return
-        _LOGGER.info(f"DEBUG STREAM: Sende {len(float_audio)} Samples...")
+        _LOGGER.info("DEBUG STREAM: Sende %d Samples", len(float_audio))
+        
         audio_int16 = (float_audio.clip(-1.0, 1.0) * 32767).astype("int16")
         audio_bytes = audio_int16.tobytes()
-        chunk_size = 2048
+        
+        # Wyoming Standard: 1024 Samples pro Chunk
+        chunk_size = 2048 
         for i in range(0, len(audio_bytes), chunk_size):
-            chunk = audio_bytes[i : i + chunk_size]
-            await self.write_event(AudioChunk(rate=24000, width=2, channels=1, audio=chunk).event())
-
+            await self.write_event(AudioChunk(rate=rate, width=2, channels=1, audio=audio_bytes[i:i+chunk_size]).event())
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=int, default=10201)
     parser.add_argument("--voice", default=DEFAULT_VOICE)
     parser.add_argument("--variant", default=MODEL_VARIANT)
     parser.add_argument("--uri", default=None)
     parser.add_argument("--zeroconf", nargs="?", const="pocket-tts")
     args, _ = parser.parse_known_args()
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
     
-    _LOGGER.info("Loading Pocket-TTS model (%s)...", args.variant)
+    _LOGGER.info("Lade Pocket-TTS Modell (%s)...", args.variant)
+    
+    # Robuster Lade-Vorgang (Positional Arguments fix)
     try:
         tts_model = TTSModel.load_model(args.variant)
-    except TypeError:
+    except Exception:
         try:
             tts_model = TTSModel.load_model(model_variant_id=args.variant)
-        except TypeError:
+        except Exception:
             tts_model = TTSModel.load_model(variant_id=args.variant)
-    
-    _LOGGER.info("Pre-loading voice states...")
+
+    _LOGGER.info("Pre-loading Voices...")
     for v in PREDEFINED_VOICES:
         try:
-             if hasattr(tts_model, 'get_state_for_audio_prompt'):
-                 _VOICE_STATES[v] = tts_model.get_state_for_audio_prompt(v)
-             else:
-                 _VOICE_STATES[v] = tts_model.get_state_for_voice(v)
+            if hasattr(tts_model, 'get_state_for_audio_prompt'):
+                _VOICE_STATES[v] = tts_model.get_state_for_audio_prompt(v)
+            else:
+                _VOICE_STATES[v] = tts_model.get_state_for_voice(v)
         except: pass
 
-    voices = [
-        TtsVoice(
-            name=v, description=f"Pocket-TTS {v}",
-            attribution=Attribution(name="Kyutai", url="https://kyutai.org"),
-            installed=True, languages=["en"], version="1.0.1", speakers=None
-        ) for v in PREDEFINED_VOICES
-    ]
+    # Wyoming Info
+    voices = [TtsVoice(name=v, description=f"Pocket-TTS {v}", attribution=Attribution(name="Kyutai", url="https://kyutai.org"),
+              installed=True, languages=["en"], version="1.0.1", speakers=None) for v in PREDEFINED_VOICES]
 
-    wyoming_info = Info(
-        tts=[TtsProgram(
-            name="pocket-tts", description="Streaming Pocket-TTS",
-            attribution=Attribution(name="Kyutai", url="https://kyutai.org"),
-            installed=True, voices=voices, version="1.0.1",
-            supports_synthesize_streaming=True
-        )]
-    )
+    wyoming_info = Info(tts=[TtsProgram(name="pocket-tts", description="Fast Streaming Pocket-TTS",
+        attribution=Attribution(name="Kyutai", url="https://kyutai.org"), installed=True, voices=voices, 
+        version="1.0.1", supports_synthesize_streaming=True)])
 
     if args.uri is None: args.uri = f"tcp://{args.host}:{args.port}"
-    _LOGGER.info("Server Ready on %s", args.uri)
     server = AsyncServer.from_uri(args.uri)
+    _LOGGER.info("Server bereit auf %s", args.uri)
     await server.run(partial(PocketTTSEventHandler, wyoming_info, args, tts_model))
 
 if __name__ == "__main__":
