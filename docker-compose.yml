@@ -1,12 +1,9 @@
 services:
   pocket-tts-wyoming:
-    # WICHTIG: Wir bauen jetzt lokal, statt das fertige Image zu laden
-    build: . 
+    build: .
     container_name: pocket-tts-wyoming
-    
-    # "host" Modus ist gut für Zeroconf (automatische Erkennung in HA)
-    # Beachte: "ports:" wird hier ignoriert, der Container nutzt direkt Port 10201 des Hosts.
-    network_mode: host 
+    network_mode: host
+    restart: unless-stopped
     
     environment:
       - WYOMING_PORT=10201
@@ -14,26 +11,18 @@ services:
       - MODEL_VARIANT=b6369a24
       - ZEROCONF=pocket-tts
       
-      # --- UNSERE TUNING VARIABLEN ---
-      # Macht den Start schneller (Standard war 0.15)
-      - PREFIX_MIN_DURATION=0.1 
-      # Optional: Debugging aktivieren, um "DEBUG STREAM" im Log zu sehen
-      - DEBUG=true
-      
-      # Cache-Pfad Variable für HuggingFace (passend zum Dockerfile)
+      # Tuning für Streaming
+      - PREFIX_MIN_DURATION=0.1
+      - DEBUG_WAV=false
       - HF_HOME=/data/hf
 
-    restart: unless-stopped
-    
     volumes:
-      # Wir mappen dein Cache-Volume auf den Pfad, den wir im Dockerfile definiert haben
+      # Hier werden die Modelle gespeichert
       - pocket-tts-hf-cache:/data/hf
       
-      # Optional: Falls du Debug-WAVs speichern willst (muss im Script aktiv sein)
+      # Optional: Output für Debug-WAVs
       - ./output:/output
 
 volumes:
   pocket-tts-hf-cache:
     driver: local
-  # Das zweite Volume (pocket-tts-cache) wird im neuen Setup eigentlich nicht mehr separat gebraucht,
-  # da alles Wichtige im HF_HOME (/data/hf) landet.
