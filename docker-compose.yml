@@ -1,21 +1,28 @@
 services:
   pocket-tts-wyoming:
-    image: ghcr.io/ikidd/pocket-tts-wyoming:latest
+    build: .
     container_name: pocket-tts-wyoming
     network_mode: host
+    restart: unless-stopped
+    
     environment:
       - WYOMING_PORT=10201
-      - WYOMING_HOST=0.0.0.0
       - DEFAULT_VOICE=alba
       - MODEL_VARIANT=b6369a24
       - ZEROCONF=pocket-tts
-    restart: unless-stopped
+      
+      # Tuning für Streaming
+      - PREFIX_MIN_DURATION=0.1
+      - DEBUG_WAV=false
+      - HF_HOME=/data/hf
+
     volumes:
-      - pocket-tts-hf-cache:/root/.cache/huggingface
-      - pocket-tts-cache:/root/.cache/pocket_tts
+      # Hier werden die Modelle gespeichert
+      - pocket-tts-hf-cache:/data/hf
+      
+      # Optional: Output für Debug-WAVs
+      - ./output:/output
 
 volumes:
   pocket-tts-hf-cache:
-    driver: local
-  pocket-tts-cache:
     driver: local
