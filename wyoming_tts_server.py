@@ -27,12 +27,10 @@ from wyoming.tts import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Umgebungsvariablen / Defaults
 DEFAULT_PORT = int(os.environ.get("WYOMING_PORT", "10201"))
 DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "alba")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", DEFAULT_VARIANT)
 
-# Trimming Tuning
 PREFIX_MIN_DURATION = 0.08
 PREFIX_MAX_DURATION = 0.8
 PREFIX_SILENCE_GAP = 0.06
@@ -47,7 +45,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
         self.wyoming_info_event = wyoming_info.event()
         self.tts_model = tts_model
         
-        # Sitzungs-Status
         self.is_streaming: bool = False
         self._text_buffer: str = ""
         self._voice_info: Optional[any] = None
@@ -62,17 +59,14 @@ class PocketTTSEventHandler(AsyncEventHandler):
             return True
 
         try:
-            # KLASSISCHES TTS (einzelner Block)
             if Synthesize.is_type(event.type):
                 if self.is_streaming or (time.time() - self._last_stream_end_time < 1.5):
-                    _LOGGER.info("Ignoriere Synthesize-Block (Streaming aktiv/kürzlich beendet).")
                     return True
                 self._cancel_current()
                 synthesize = Synthesize.from_event(event)
                 self._current_task = asyncio.create_task(self._run_single(synthesize))
                 return True
 
-            # START TEXT-STREAM (LLM fängt an)
             if SynthesizeStart.is_type(event.type):
                 self._cancel_current()
                 start_event = SynthesizeStart.from_event(event)
@@ -82,79 +76,82 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 self._voice_info = start_event.voice
                 self._audio_started = False
                 self._chunk_count = 0
-                _LOGGER.info("LLM Stream gestartet.")
                 return True
 
-            # TEXT CHUNKS VOM LLM
             if SynthesizeChunk.is_type(event.type):
                 if not self.is_streaming: return True
                 chunk = SynthesizeChunk.from_event(event)
                 self._text_buffer += chunk.text
                 
-                # Entscheidungslogik für das Fenster
+                # Bestimme Threshold für Chunks
+                # Chunk 0 (Satz 1): 1 Satz
+                # Chunk 1 (Satz 2-3): 2 Sätze
+                # Chunk 2+ (Rest): Alles verfügbare
                 if self._chunk_count == 0:
-                    # Erster Satz: Sofort (1 Satz)
-                    if self._count_sentences(self._text_buffer) >= 1:
-                        await self._process_buffer(threshold=1)
+                    threshold = 1
                 elif self._chunk_count == 1:
-                    # Zweiter Chunk: 2 Sätze
-                    if self._count_sentences(self._text_buffer) >= 2:
-                        await self._process_buffer(threshold=2)
+                    threshold = 2
                 else:
-                    # Ab drittem Chunk: Alles nehmen, sobald ein neuer Satz fertig ist
-                    if self._count_sentences(self._text_buffer) >= 1:
-                        await self._process_buffer(force_all_sentences=True)
+                    threshold = 1 # "Mindestens 1", aber wir nehmen im Code dann alles
+
+                if self._count_sentences(self._text_buffer) >= threshold:
+                    # Ab dem 3. Chunk (index 2) nutzen wir force_all_sentences
+                    await self._process_buffer(
+                        threshold=threshold, 
+                        take_all_complete=(self._chunk_count >= 2)
+                    )
                 return True
 
-            # LLM FERTIG
             if SynthesizeStop.is_type(event.type):
                 if self.is_streaming:
-                    # Alles was noch im Puffer ist (auch ohne Satzzeichen am Ende)
                     await self._process_buffer(force_all_buffer=True)
                     if self._audio_started:
                         await self.write_event(AudioStop().event())
                     await self.write_event(SynthesizeStopped().event())
                     self.is_streaming = False
                     self._last_stream_end_time = time.time()
-                    _LOGGER.info("LLM Stream beendet.")
                 return True
 
             return True
         except Exception as err:
-            _LOGGER.error("Fehler im Handler: %s", err)
+            _LOGGER.error("Fehler: %s", err)
             return False
 
     def _count_sentences(self, text: str) -> int:
-        return len(re.findall(r'[.!?\n]', text))
+        # Splittet nur bei . ! ? gefolgt von Leerzeichen oder Ende
+        return len(re.findall(r'[.!?](\s|$)', text))
 
     def _cancel_current(self):
         if self._current_task and not self._current_task.done():
-            _LOGGER.info("Abbruch laufender Generierung.")
             self._current_task.cancel()
 
-    async def _process_buffer(self, threshold=1, force_all_sentences=False, force_all_buffer=False):
+    async def _process_buffer(self, threshold=1, take_all_complete=False, force_all_buffer=False):
         if not self._text_buffer.strip(): return
 
         to_speak = ""
+        # Wir splitten bei Satzzeichen gefolgt von Whitespace
+        # Die Klammern im Regex ( ) sorgen dafür, dass die Satzzeichen im Array bleiben
+        split_pattern = r'([.!?](?:\s+|$))'
+        
         if force_all_buffer:
-            # Wirklich ALLES nehmen (beim finalen Stop)
             to_speak = self._text_buffer.strip()
             self._text_buffer = ""
-        elif force_all_sentences:
-            # Alle fertigen Sätze nehmen
-            parts = re.split(r'([.!?\n]+)', self._text_buffer)
-            # Wir nehmen alles bis zum letzten gefundenen Satzzeichen
-            # regex split liefert bei "Hallo. Welt" -> ["Hallo", ".", " Welt"]
-            # Die Länge ist also immer (Anzahl Sätze * 2) + 1 (der Rest ohne Satzzeichen)
-            last_punctuation_idx = (len(parts) // 2) * 2
-            to_speak = "".join(parts[:last_punctuation_idx]).strip()
-            self._text_buffer = "".join(parts[last_punctuation_idx:]).strip()
         else:
-            # Nur eine feste Anzahl an Sätzen (threshold)
-            parts = re.split(r'([.!?\n]+)', self._text_buffer)
-            end_idx = threshold * 2
-            to_speak = "".join(parts[:end_idx]).strip()
-            self._text_buffer = "".join(parts[end_idx:]).strip()
+            parts = re.split(split_pattern, self._text_buffer)
+            # parts sieht so aus: ["Satz 1", ". ", "Satz 2", "! ", "Restlicher Text"]
+            
+            if take_all_complete:
+                # Nimm alle fertigen Sätze
+                last_punctuation_idx = (len(parts) // 2) * 2
+                if last_punctuation_idx > 0:
+                    to_speak = "".join(parts[:last_punctuation_idx]).strip()
+                    self._text_buffer = "".join(parts[last_punctuation_idx:])
+            else:
+                # Nimm genau 'threshold' Sätze
+                if len(parts) >= (threshold * 2):
+                    end_idx = threshold * 2
+                    to_speak = "".join(parts[:end_idx]).strip()
+                    self._text_buffer = "".join(parts[end_idx:])
 
         if to_speak:
             self._chunk_count += 1
@@ -165,10 +162,8 @@ class PocketTTSEventHandler(AsyncEventHandler):
         await self._handle_synthesize(synthesize.text, synthesize.voice, is_last=True)
 
     async def _handle_synthesize(self, text: str, voice_obj: Optional[any], is_last: bool) -> bool:
-        text_to_speak = text.strip()
-        if not text_to_speak: return True
-
-        processed_text = "... " + text_to_speak
+        if not text.strip(): return True
+        processed_text = "... " + text
         voice_name = voice_obj.name if voice_obj else self.cli_args.voice
         if voice_name and voice_name.startswith("pocket-tts-"):
             voice_name = voice_name.replace("pocket-tts-", "", 1)
@@ -197,7 +192,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
                 
                 for chunk_tensor in audio_stream:
-                    # Abbruchprüfung
                     if asyncio.current_task().cancelled():
                         raise asyncio.CancelledError()
 
@@ -221,7 +215,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
                     await self.write_event(AudioStop().event())
                 
             except asyncio.CancelledError:
-                _LOGGER.info("Generierung abgebrochen.")
                 await self.write_event(AudioStop().event())
                 raise 
             except Exception as e:
