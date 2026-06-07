@@ -4,7 +4,12 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/kyutai-labs/pocket-tts.git .
+# Pin pocket-tts to the commit the wyoming server was written against.
+# Newer upstream commits rename DEFAULT_VARIANT -> DEFAULT_LANGUAGE and
+# change the model-loading API, breaking this server.
+ARG POCKET_TTS_REF=119ca2e618dd38e8907c0bc9609c8d1773853062
+RUN git clone https://github.com/kyutai-labs/pocket-tts.git . \
+ && git checkout "${POCKET_TTS_REF}"
 
 COPY wyoming_tts_server.py .
 
