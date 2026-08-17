@@ -2,6 +2,13 @@
 
 Wyoming protocol server for [Pocket-TTS](https://github.com/kyutai-labs/pocket-tts), enabling Home Assistant integration with voice selection support.
 
+## Changes in this fork
+
+This fork of [ikidd/pocket-tts-wyoming](https://github.com/ikidd/pocket-tts-wyoming) contains two fixes:
+
+- **Streaming audio to Home Assistant.** The upstream server drained the entire Pocket-TTS generator and concatenated the waveform in memory before emitting any `AudioChunk` events. On CPUs without NNPACK, longer inputs could take tens of seconds, during which Home Assistant's Wyoming client timed out and dropped the socket (`ConnectionResetError` / `BrokenPipeError`), so long text appeared to "not generate audio." The server now buffers only the short head needed to resolve the sacrificial `...` prefix-trim window (`PREFIX_MAX_DURATION`, ~1s), then forwards chunks to HA as they are produced. First chunk now arrives in under a second even for multi-sentence inputs.
+- **Pinned upstream Pocket-TTS commit.** `kyutai-labs/pocket-tts` renamed `DEFAULT_VARIANT` to `DEFAULT_LANGUAGE` and reshaped the model-loading API, which breaks a fresh build of the upstream Dockerfile with `ImportError`. The Dockerfile now pins `pocket-tts` to the last commit this shim was written against (`119ca2e`) via the `POCKET_TTS_REF` build arg. Override with `--build-arg POCKET_TTS_REF=<sha>` if you want to test a newer commit.
+
 ## Quick Start with Docker Compose
 
 Use the included `docker-compose.yml` file:
@@ -83,6 +90,12 @@ If you prefer to build the image locally instead of using the pre-built image:
 docker build -t pocket-tts-wyoming .
 ```
 
+To build against a different Pocket-TTS commit, pass the build arg:
+
+```bash
+docker build --build-arg POCKET_TTS_REF=<sha> -t pocket-tts-wyoming .
+```
+
 Then update `docker-compose.yml` to use `build: .` instead of `image: ghcr.io/ikidd/pocket-tts-wyoming:latest`.
 
 
@@ -139,6 +152,8 @@ Audio-prompt based TTS models like Pocket-TTS can "swallow" the first word into 
 - **Image pull issues**: If you encounter authentication issues pulling from GHCR, ensure you're logged in: `docker login ghcr.io`
 - **Outdated image**: Pull the latest image with `docker compose pull` or `docker pull ghcr.io/ikidd/pocket-tts-wyoming:latest`
 - **First word cut off**: Run in debug mode and check the WAV files. Adjust the timing tunables as needed.
+- **Long text produces no audio / socket errors in logs**: Fixed in this fork — see [Changes in this fork](#changes-in-this-fork). If you are still on the upstream image, rebuild from this fork or pull the local image built from this repo.
+- **`ImportError: cannot import name 'DEFAULT_VARIANT'` on build**: Upstream Pocket-TTS moved on. This fork pins a known-good commit; rebuild from this repo, or pass `--build-arg POCKET_TTS_REF=<sha>` to test a different pin.
 
 - **⏳ Last Build On**: Never
 - **🔄 Last Run**: 2026-01-20 00:30:58 UTC
