@@ -8,6 +8,8 @@ services:
       - WYOMING_HOST=0.0.0.0
       - DEFAULT_VOICE=alba
       - MODEL_VARIANT=english
+      - NORMALIZE_AUDIO=true
+      - TARGET_RMS=0.1
       - ZEROCONF=pocket-tts
     restart: unless-stopped
     volumes:

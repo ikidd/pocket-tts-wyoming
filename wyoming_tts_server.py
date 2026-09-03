@@ -48,6 +48,8 @@ DEFAULT_LANGUAGE = "english"
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT", DEFAULT_LANGUAGE)
 MODEL_VARIANT = _LEGACY_VARIANT_MAP.get(MODEL_VARIANT, MODEL_VARIANT)
 DEBUG_WAV = os.environ.get("DEBUG_WAV", "").lower() in ("true", "1", "yes")
+NORMALIZE_AUDIO = os.environ.get("NORMALIZE_AUDIO", "true").lower() in ("true", "1", "yes")
+TARGET_RMS = float(os.environ.get("TARGET_RMS", "0.1"))  # ~ -20 dBFS, adjust to taste
 
 # Prefix trimming tunables (in seconds)
 # Minimum time before looking for the pause after the sacrificial prefix
@@ -287,6 +289,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
                         last_non_silent = non_silent_indices[-1] + padding_samples
                         full_audio = full_audio[:last_non_silent + 1]
 
+                full_audio = _normalize_audio(full_audio)
                 full_audio = (full_audio.clip(-1.0, 1.0) * 32767).astype("int16")
                 audio_bytes = full_audio.tobytes()
 
@@ -330,6 +333,15 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
         return True
 
+def _normalize_audio(audio: numpy.ndarray) -> numpy.ndarray:
+    """Bring all voices to a comparable perceived loudness (RMS-based)."""
+    if not NORMALIZE_AUDIO:
+        return audio
+    rms = numpy.sqrt(numpy.mean(numpy.square(audio)))
+    if rms < 1e-6:
+        return audio  # near-silence; avoid divide-by-zero / noise amplification
+    gain = min(TARGET_RMS / rms, 10.0)  # cap gain so we don't blow up quiet artifacts
+    return audio * gain
 
 async def main() -> None:
     """Main entry point."""

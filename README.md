@@ -17,6 +17,8 @@ services:
       - WYOMING_HOST=0.0.0.0
       - DEFAULT_VOICE=alba
       - MODEL_VARIANT=english
+      - NORMALIZE_AUDIO=true
+      - TARGET_RMS=0.1
       - ZEROCONF=pocket-tts
     restart: unless-stopped
     volumes:
@@ -40,6 +42,8 @@ You can customize the following environment variables in the compose file before
 | `WYOMING_HOST` | `0.0.0.0` | The network interface to bind to. `0.0.0.0` accepts connections from any interface. |
 | `DEFAULT_VOICE` | `alba` | The default voice used when none is specified. See [Available Voices](#available-voices) for options. |
 | `MODEL_VARIANT` | `english` | The Pocket-TTS language to use. |
+| `NORMALIZE_AUDIO` | `true` | Enables volume normalization. If set to `true`, all voices will have a consistent volume. |
+| `TARGET_RMS` | `0.1` | Target RMS for volume normalization (`0.1` = ~ -20 dBFS). Only used if `NORMALIZE_AUDIO` is `true`. |
 | `ZEROCONF` | `pocket-tts` | Service name for mDNS/Zeroconf discovery. Home Assistant uses this to auto-discover the TTS server. Set to empty string to disable. |
 
 Pull and start:
@@ -144,6 +148,6 @@ Audio-prompt based TTS models like Pocket-TTS can "swallow" the first word into 
 - **🔄 Last Run**: 2026-01-20 00:30:58 UTC
 - **Last Upstream SHA**: 6f9dd250c24ee85cecc5587902a684f0d82b2a0d 
 ## 📅 Release Status
-- **⏳ Last Build On**: 2026-09-02 03:40:41 UTC
-- **🔄 Last Run**: 2026-09-02 03:40:41 UTC
-- **Last Upstream SHA**: 2dd548a811fe5f74b534e06480a3970019b3dc79
+- **⏳ Last Build On**: 2026-09-03 03:12:56 UTC
+- **🔄 Last Run**: 2026-09-03 03:12:56 UTC
+- **Last Upstream SHA**: 60d5ad6e8afa709f9362eeb9ba64fe90ff691c90
