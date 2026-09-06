@@ -144,6 +144,6 @@ Audio-prompt based TTS models like Pocket-TTS can "swallow" the first word into 
 - **🔄 Last Run**: 2026-01-20 00:30:58 UTC
 - **Last Upstream SHA**: 6f9dd250c24ee85cecc5587902a684f0d82b2a0d 
 ## 📅 Release Status
-- **⏳ Last Build On**: 2026-09-05 03:40:36 UTC
-- **🔄 Last Run**: 2026-09-05 03:40:36 UTC
-- **Last Upstream SHA**: a3e57af8f173df46cbed8ff48e287a9fd1890750
+- **⏳ Last Build On**: 2026-09-06 03:42:40 UTC
+- **🔄 Last Run**: 2026-09-06 03:42:40 UTC
+- **Last Upstream SHA**: f544a39b07db56fadeed575d57a33e1eda17c022
